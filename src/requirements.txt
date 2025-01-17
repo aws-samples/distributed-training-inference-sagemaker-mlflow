@@ -1,0 +1,6 @@
+click
+faiss-gpu-cu12 
+torchrec
+fbgemm-gpu
+mlflow==2.13.2 
+sagemaker-mlflow==0.1.0
