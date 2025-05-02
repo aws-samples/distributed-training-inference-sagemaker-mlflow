@@ -1,6 +1,9 @@
+from djl_python import Input, Output
+
 from typing import List, Optional
 import json
 import os
+import time
 import faiss  # @manual=//faiss/python:pyfaiss_gpu
 import faiss.contrib.torch_utils  # @manual=//faiss/contrib:faiss_contrib_gpu
 import torch
@@ -14,12 +17,11 @@ from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed._shard.sharded_tensor.shard import Shard
-from torch.distributed._shard.metadata import ShardMetadata 
+from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed.remote_device import _remote_device
 from torchrec.distributed.types import ShardingType
 from knn_index import get_index
 from torch import distributed as dist
-import time
 
 # pyre-ignore[21]
 # @manual=//torchrec/github/examples/retrieval/modules:two_tower
@@ -28,25 +30,34 @@ from modules.two_tower import (  # noqa F811
     TwoTowerRetrieval,
 )
 
+
 two_tower_column_names = DEFAULT_RATINGS_COLUMN_NAMES[:2]
 local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 world_size = int(os.environ.get("WORLD_SIZE", "1"))
 rank = int(os.environ.get("RANK", "0"))
 
-def load_model(num_embeddings: int = 1024 * 1024,
-            embedding_dim: int = 64,
-            layer_sizes: Optional[List[int]] = None,
-            num_centroids: int = 100,
-            k: int = 100,
-            num_subquantizers: int = 8,
-            bits_per_code: int = 8,
-            num_probe: int = 8,
-            model_device_idx: int = 0,
-            faiss_device_idx: int = 0,
-            batch_size: int = 32,
-            load_dir: Optional[str] = "/opt/ml/model",
-            world_size: int = 1,
-        ) -> DistributedModelParallel:
+
+class TwoTowerHandler(object):
+    def __init__(self):
+        self.model = None
+        self.device = None
+        self.initialized = False
+
+    def load_model(self,
+                   num_embeddings: int = 1024 * 1024,
+                   embedding_dim: int = 64,
+                   layer_sizes: Optional[List[int]] = None,
+                   num_centroids: int = 100,
+                   k: int = 100,
+                   num_subquantizers: int = 8,
+                   bits_per_code: int = 8,
+                   num_probe: int = 8,
+                   model_device_idx: int = 0,
+                   faiss_device_idx: int = 0,
+                   batch_size: int = 32,
+                   load_dir: Optional[str] = "/opt/ml/model",
+                   world_size: int = 1,
+                   ) -> DistributedModelParallel:
         """
         Loads the serialized model and FAISS index from `two_tower_train.py`.
         A `TwoTowerRetrieval` model is instantiated, which wraps the `KNNIndex`, the query (user) tower and the candidate item (movie) tower inside an `nn.Module`.
@@ -73,8 +84,8 @@ def load_model(num_embeddings: int = 1024 * 1024,
             layer_sizes = [128, 64]
         assert torch.cuda.is_available(), "This example requires a GPU"
 
-        device: torch.device = torch.device(f"cuda:{rank}")
-        torch.cuda.set_device(device)
+        self.device: torch.device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(self.device)
 
         two_tower_column_names = DEFAULT_RATINGS_COLUMN_NAMES[:2]
         ebcs = []
@@ -129,7 +140,7 @@ def load_model(num_embeddings: int = 1024 * 1024,
             index.add(embeddings)
 
         retrieval_model = TwoTowerRetrieval(
-            index, ebcs[0], ebcs[1], layer_sizes, k, device)
+            index, ebcs[0], ebcs[1], layer_sizes, k, self.device)
 
         constraints = {}
         for feature_name in two_tower_column_names:
@@ -138,51 +149,61 @@ def load_model(num_embeddings: int = 1024 * 1024,
                 compute_kernels=[EmbeddingComputeKernel.QUANT.value],
             )
 
-        dmp = DistributedModelParallel(
+        self.model = DistributedModelParallel(
             module=retrieval_model,
-            device=device,
+            device=self.device,
             # env=ShardingEnv.from_local(world_size=world_size, rank=model_device_idx),
             init_data_parallel=False,
         )
 
         if retrieval_sd is not None:
-            dmp.load_state_dict(retrieval_sd)
+            self.model.load_state_dict(retrieval_sd)
 
-        return dmp
+    def initialize(self, properties):
+        """Initialize model and load weights"""
+        self.load_model()
+        # self.model.to(self.device)
+        self.model.eval()
+        self.initialized = True
 
-def model_fn(model_dir):
-    """Load the model for inference"""
-    model = load_model()
-    model.eval()
-    return model
+    def inference(self, inputs: Input) -> Output:
+        if not self.initialized:
+            self.initialize(inputs.get_properties())
 
-def input_fn(request_body, request_content_type):
-    """Deserialize and prepare the prediction input"""
-    if request_content_type == "application/json":
-        input_data = json.loads(request_body)["inputs"]
-        return torch.tensor(input_data, dtype=torch.int64)
-    raise ValueError(f"Unsupported content type: {request_content_type}")
+        # Parse input
+        input_data = inputs.get_as_json().get("inputs")
+        input = torch.tensor(input_data, dtype=torch.int64)
 
-def predict_fn(input_data, model):
-    """Perform prediction"""
+        # Inference
+        batch_size = input.shape[0]
+        batch = KeyedJaggedTensor(
+            keys=[two_tower_column_names[0]],
+            values=input.to(self.device),
+            lengths=torch.tensor([1] * batch_size, device=self.device),
+        )
+        actual_result = self.model(batch)
+        # Convert to NumPy array
+        numpy_data = actual_result.detach().cpu().numpy()
 
-    device = torch.device(f"cuda:{rank}")
-    batch_size = input_data.shape[0]
-    batch = KeyedJaggedTensor(
-        keys=[two_tower_column_names[0]],
-        values=input_data.to(device),
-        lengths=torch.tensor([1] * batch_size, device=device),
-    )
+        # Prepare output
+        result = numpy_data.tolist()
+        time.sleep(0.5) # temporarily simulating a delay for shadow testing.
+        return Output().add_as_json(result)
 
-    actual_result = model(batch)
-    # Convert to NumPy array
-    numpy_data = actual_result.detach().cpu().numpy()
-    return numpy_data
 
-def output_fn(prediction, response_content_type):
-    """Serialize and return the prediction output"""
-    if response_content_type == "application/json":
-        response = prediction.tolist()
-        time.sleep(0.5) # temporarily simulating a delay for shadow testing. 
-        return json.dumps({"predictions": response})
-    raise ValueError(f"Unsupported content type: {response_content_type}")
+_service = TwoTowerHandler()
+
+
+def handle(inputs: Input):
+    """
+    Default handler function
+    """
+    if not _service.initialized:
+        # stateful model
+        _service.initialize(inputs.get_properties())
+
+    if inputs.is_empty():
+        # initialization request
+        return None
+
+    return _service.inference(inputs)
