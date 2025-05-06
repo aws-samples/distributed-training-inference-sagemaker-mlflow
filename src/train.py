@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 import glob
 from typing import List, Optional
 
@@ -225,6 +226,7 @@ def train(
             torch.save(model.state_dict(), f"{save_dir}/model.pt")
             # pyre-ignore[16]
             faiss.write_index(index, f"{save_dir}/faiss.index")
+
 
 if __name__ =='__main__':
 
